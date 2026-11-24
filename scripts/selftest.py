@@ -239,9 +239,132 @@ def main() -> int:
         f'{kept["row"]},{kept["col"]}',
     )
 
+    # 5) 两片晶圆同名工序明细对调：试算、修订号失效、确认、回滚校验
+    run_swap_checks(browser)
+
     failed = [c for c in CHECKS if not c[1]]
     print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} 项通过")
     return 1 if failed else 0
+
+
+def run_swap_checks(browser: Browser) -> None:
+    # 5.1 一键建立两片“封装传反”的同规格晶圆
+    status, _text, headers = browser._send(
+        "POST", "/wafers/demo-swap-pair", b"",
+        {"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    location = headers.get("Location", "")
+    match = re.search(r"left_id=(\d+)&right_id=(\d+)", location)
+    check("对调演示两片晶圆建立成功", status in (302, 303) and match is not None, f"HTTP {status} {location}")
+    if match is None:
+        return
+    left_id, right_id = int(match.group(1)), int(match.group(2))
+
+    status, page = browser.get(location)
+    check("对调试算页可访问并预选工序", status == 200 and "封装" in page)
+
+    # 5.2 只读试算：显示两片换前/换后待定缺陷数
+    trial = api_post(browser, "/api/wafers/swaps/trial",
+                     {"left_id": left_id, "right_id": right_id, "step_name": "封装"})
+    by_id = {w["wafer_id"]: w for w in trial["wafers"]}
+    check(
+        "试算给出两片换前/换后待定数",
+        (by_id[left_id]["pending_before"], by_id[left_id]["pending_after"]) == (0, 2)
+        and (by_id[right_id]["pending_before"], by_id[right_id]["pending_after"]) == (2, 0),
+        str([(w["wafer_id"], w["pending_before"], w["pending_after"]) for w in trial["wafers"]]),
+    )
+    check("换入明细都有同号定位点", all(trial["shared_locators"]))
+    # 试算不写库：修订号仍为 0
+    locs = api(browser, f"/api/wafers/{left_id}/locators")
+    check("试算期间修订号不变", locs["revision"] == 0, str(locs["revision"]))
+
+    # 5.3 试算期间照常改点；随后用旧修订号确认必须被拒绝
+    locators = api(browser, f"/api/wafers/{left_id}/locators")
+    c1 = _find_locator(next(s for s in locators["steps"] if s["name"] == "沉积"), "C1")
+    status, _ = browser.post_form(
+        f"/wafers/{left_id}/locators/{c1['id']}/correct",
+        {"step": "3", "row": str(c1["row"]), "col": str(c1["col"])},
+    )
+    check("试算期间改点照常成功", status in (302, 303), f"HTTP {status}")
+    status, _ = browser.post_form(
+        "/wafers/swaps/commit",
+        {
+            "left_id": str(left_id), "right_id": str(right_id), "step_name": "封装",
+            "rev_left": "0", "rev_right": "0",
+        },
+    )
+    check("旧修订号确认被拒绝（302 回试算页）", status in (302, 303), f"HTTP {status}")
+    locs = api(browser, f"/api/wafers/{left_id}/locators")
+    check("拒绝后对调未发生（仍为强约束封装 C1+L1）",
+          sorted(l["pid"] for l in locs["steps"][5]["locators"]) == ["C1", "L1"])
+
+    # 5.4 重新试算，取新修订号后确认成功
+    trial = api_post(browser, "/api/wafers/swaps/trial",
+                     {"left_id": left_id, "right_id": right_id, "step_name": "封装"})
+    revs = {w["wafer_id"]: w["revision"] for w in trial["wafers"]}
+    status, _ = browser.post_form(
+        "/wafers/swaps/commit",
+        {
+            "left_id": str(left_id), "right_id": str(right_id), "step_name": "封装",
+            "rev_left": str(revs[left_id]), "rev_right": str(revs[right_id]),
+        },
+    )
+    check("确认对调成功", status in (302, 303), f"HTTP {status}")
+
+    data_l = api(browser, f"/api/wafers/{left_id}/defects")
+    data_r = api(browser, f"/api/wafers/{right_id}/defects")
+    pack_l = {r["defect"]: r for r in data_l["results"] if r["step"] == "封装"}
+    pack_r = {r["defect"]: r for r in data_r["results"] if r["step"] == "封装"}
+    check("对调后甲片封装 D102/D104 待定",
+          pack_l["D102"]["status"] == "pending" and pack_l["D104"]["status"] == "pending")
+    check("对调后乙片封装全部确定",
+          all(r["status"] == "determined" for r in pack_r.values()))
+    check("对调后两片仍可对齐（方案数 2 / 1）",
+          data_l["scheme_count"] == 2 and data_r["scheme_count"] == 1,
+          f'{data_l["scheme_count"]} / {data_r["scheme_count"]}')
+    check("同号 D105 行列随明细走（两片来源不同）",
+          pack_l["D105"]["source"] != pack_r["D105"]["source"],
+          f'{pack_l["D105"]["source"]} vs {pack_r["D105"]["source"]}')
+    locs_l = api(browser, f"/api/wafers/{left_id}/locators")
+    locs_r = api(browser, f"/api/wafers/{right_id}/locators")
+    check("两片修订号都已推进",
+          locs_l["revision"] >= 2 and locs_r["revision"] >= 1,
+          f'{locs_l["revision"]} / {locs_r["revision"]}')
+
+    # 5.5 反向再对调一次，数据应回到传反前的状态
+    trial = api_post(browser, "/api/wafers/swaps/trial",
+                     {"left_id": left_id, "right_id": right_id, "step_name": "封装"})
+    revs = {w["wafer_id"]: w["revision"] for w in trial["wafers"]}
+    browser.post_form(
+        "/wafers/swaps/commit",
+        {
+            "left_id": str(left_id), "right_id": str(right_id), "step_name": "封装",
+            "rev_left": str(revs[left_id]), "rev_right": str(revs[right_id]),
+        },
+    )
+    data_l2 = api(browser, f"/api/wafers/{left_id}/defects")
+    pack_l2 = {r["defect"]: r for r in data_l2["results"] if r["step"] == "封装"}
+    check("再对调一次恢复原状（甲片封装全部确定）",
+          all(r["status"] == "determined" for r in pack_l2.values()))
+
+    # 5.6 非法选择：基准工序、同片、不存在的晶圆
+    bad = api_post(browser, "/api/wafers/swaps/trial",
+                   {"left_id": left_id, "right_id": right_id, "step_name": "光刻"}, expect_error=True)
+    check("基准工序拒绝对调", bad is not None and "基准" in str(bad))
+    bad = api_post(browser, "/api/wafers/swaps/trial",
+                   {"left_id": left_id, "right_id": left_id, "step_name": "封装"}, expect_error=True)
+    check("同片对调被拒绝", bad is not None and "不同" in str(bad))
+
+
+def api_post(browser: Browser, path: str, payload: dict, expect_error: bool = False):
+    body = json.dumps(payload).encode()
+    status, text = browser._send("POST", path, body, {"Content-Type": "application/json"})[:2]
+    data = json.loads(text)
+    if expect_error:
+        return data if status >= 400 else None
+    if status != 200:
+        raise RuntimeError(f"{path} -> HTTP {status}: {text}")
+    return data
 
 
 def _find_locator(step: dict, pid: str) -> dict:

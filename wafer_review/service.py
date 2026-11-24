@@ -20,6 +20,7 @@ from .model import (
     Wafer,
     compute_feasibility,
 )
+from .swap import StaleSnapshotError, plan_swap
 
 MAX_STEPS = 6
 
@@ -252,3 +253,89 @@ def delete_wafer(db_path: str | Path, wafer_id: int) -> None:
     with connect(db_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("DELETE FROM wafer WHERE id = ?", (wafer_id,))
+
+
+def _overwrite_records(
+    conn: sqlite3.Connection,
+    step_id: int,
+    locators: list[tuple[str, int, int]],
+    defects: list[tuple[str, int, int]],
+) -> None:
+    """整份替换一道工序的定位点与缺陷（编号和行列随明细走）。"""
+    conn.execute("DELETE FROM locator WHERE step_id = ?", (step_id,))
+    conn.execute("DELETE FROM defect WHERE step_id = ?", (step_id,))
+    conn.executemany(
+        "INSERT INTO locator (step_id, pid, row, col) VALUES (?, ?, ?, ?)",
+        [(step_id, pid, row, col) for pid, row, col in locators],
+    )
+    conn.executemany(
+        "INSERT INTO defect (step_id, did, row, col) VALUES (?, ?, ?, ?)",
+        [(step_id, did, row, col) for did, row, col in defects],
+    )
+
+
+def swap_step_details(
+    db_path: str | Path,
+    left_id: int,
+    right_id: int,
+    step_name: str,
+    expected_revisions: dict[int, int],
+):
+    """对调两片同规格晶圆同名非基准工序的整份明细（一个事务，两片一起回滚）。
+
+    ``expected_revisions`` 是试算取数时的修订号；任一片在此之后被成功改动过
+    （补点/改点/撤点/对调都会推高修订号），抛出 :class:`StaleSnapshotError`，
+    要求重新试算。
+    """
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            left = _reload_id(conn, left_id)
+            right = _reload_id(conn, right_id)
+
+            # 确认时按当前已提交状态完整重算一遍试算（同规格、同号定位点、可对齐）。
+            trial = plan_swap(left, right, step_name)
+
+            for wafer in (left, right):
+                if expected_revisions.get(wafer.id) != wafer.revision:
+                    raise StaleSnapshotError(
+                        "取数后晶圆数据已变化，请重新试算后再确认对调。"
+                    )
+
+            step_l = next(s for s in left.steps if s.name == step_name)
+            step_r = next(s for s in right.steps if s.name == step_name)
+            locs_l = [(loc.pid, loc.row, loc.col) for loc in step_l.locators]
+            defs_l = [(d.did, d.row, d.col) for d in step_l.defects]
+            locs_r = [(loc.pid, loc.row, loc.col) for loc in step_r.locators]
+            defs_r = [(d.did, d.row, d.col) for d in step_r.defects]
+
+            # 整份互换：先删后插，新记录使用新主键，编号与行列全部随明细走。
+            _overwrite_records(conn, step_l.id, locs_r, defs_r)
+            _overwrite_records(conn, step_r.id, locs_l, defs_l)
+
+            # 在已写入的数据上再次校验：任一片无法对齐就整体回滚到对调前。
+            reloaded_l = _reload_id(conn, left_id)
+            reloaded_r = _reload_id(conn, right_id)
+            if not compute_feasibility(reloaded_l).solvable:
+                raise NoSolutionError(
+                    f"对调后 {reloaded_l.name} 无可行方案，已保留对调前状态。"
+                )
+            if not compute_feasibility(reloaded_r).solvable:
+                raise NoSolutionError(
+                    f"对调后 {reloaded_r.name} 无可行方案，已保留对调前状态。"
+                )
+
+            _bump(conn, left_id)
+            _bump(conn, right_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return trial
+
+
+def _reload_id(conn: sqlite3.Connection, wafer_id: int) -> Wafer:
+    wafer = load_wafer(conn, wafer_id)
+    if wafer is None:
+        raise ValidationError(f"晶圆 {wafer_id} 不存在")
+    return wafer

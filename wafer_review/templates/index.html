@@ -13,7 +13,13 @@
 <section class="panel">
   <div class="panel-head">
     <h2>已建立记录</h2>
-    <a class="button" href="{{ url_for('new_wafer') }}">新建复查</a>
+    <div class="inline">
+      <a class="button ghost" href="{{ url_for('swap_form') }}">两片晶圆对调工序</a>
+      <form method="post" action="{{ url_for('create_demo_swap_pair') }}">
+        <button class="button ghost" type="submit">一键建立对调演示（两片）</button>
+      </form>
+      <a class="button" href="{{ url_for('new_wafer') }}">新建复查</a>
+    </div>
   </div>
   <table class="table">
     <thead>
@@ -59,7 +65,12 @@
 <section class="panel empty">
   <h2>还没有记录</h2>
   <p>上传最多 {{ max_steps }} 道工序的 CSV，第一张图作为基准。</p>
-  <a class="button" href="{{ url_for('new_wafer') }}">新建复查</a>
+  <div class="actions" style="justify-content:center">
+    <a class="button" href="{{ url_for('new_wafer') }}">新建复查</a>
+    <form method="post" action="{{ url_for('create_demo_swap_pair') }}">
+      <button class="button ghost" type="submit">一键建立对调演示（两片）</button>
+    </form>
+  </div>
 </section>
 {% endif %}
 

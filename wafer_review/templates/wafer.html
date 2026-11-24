@@ -18,7 +18,10 @@
         · 生成耗时 {{ '%.1f'|format(feasibility.elapsed_ms) }} ms
       </p>
     </div>
-    <a class="button ghost" href="{{ url_for('index') }}">返回列表</a>
+    <div class="inline">
+      <a class="button ghost" href="{{ url_for('swap_form', left_id=wafer.id) }}">与另一片对调工序</a>
+      <a class="button ghost" href="{{ url_for('index') }}">返回列表</a>
+    </div>
   </div>
 
   {% if not feasibility.solvable %}

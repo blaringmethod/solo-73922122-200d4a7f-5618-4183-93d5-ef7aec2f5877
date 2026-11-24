@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}工序明细对调 · 晶圆缺陷坐标复查{% endblock %}
+{% block body %}
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <h2>两片晶圆 · 同名工序明细对调</h2>
+      <p class="muted small">
+        适用于两片同规格晶圆的同一道非基准工序 CSV 传反：对调后该工序的定位点与缺陷
+        <strong>整份互换</strong>，编号与行列都随明细走；基准工序不参与对调。
+        试算只读已提交状态，期间补点、改点、撤点照常进行；取数后任一片被成功改动，
+        确认时会要求重新试算。
+      </p>
+    </div>
+    <a class="button ghost" href="{{ url_for('index') }}">返回列表</a>
+  </div>
+
+  {% if wafers|length < 2 %}
+  <div class="flash warn">至少需要两片晶圆。可先到“新建复查”上传，或在首页一键建立对调演示数据。</div>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('swap_trial') }}" class="swap-form">
+    <div class="grid2">
+      <label class="field">
+        <span>晶圆甲</span>
+        <select name="left_id" required>
+          <option value="">请选择…</option>
+          {% for w in wafers %}
+          <option value="{{ w.id }}" {% if preselect.left_id|string == w.id|string %}selected{% endif %}>
+            #{{ w.id }} · {{ w.name }}（{{ w.grid_size }}×{{ w.grid_size }}，{{ w.steps|length }} 道工序，r{{ w.revision }}）
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field">
+        <span>晶圆乙</span>
+        <select name="right_id" required>
+          <option value="">请选择…</option>
+          {% for w in wafers %}
+          <option value="{{ w.id }}" {% if preselect.right_id|string == w.id|string %}selected{% endif %}>
+            #{{ w.id }} · {{ w.name }}（{{ w.grid_size }}×{{ w.grid_size }}，{{ w.steps|length }} 道工序，r{{ w.revision }}）
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    <label class="field">
+      <span>要对调的同名非基准工序</span>
+      <select name="step_name" required>
+        <option value="">请选择…</option>
+        {% for w in wafers if w.id|string == preselect.left_id|string %}
+          {% for s in w.steps if not s.is_baseline %}
+          <option value="{{ s.name }}" {% if preselect.step == s.name %}selected{% endif %}>
+            工序 {{ s.seq }} · {{ s.name }}
+          </option>
+          {% endfor %}
+        {% endfor %}
+        {% if not preselect.left_id %}
+          <option value="" disabled>先选择晶圆甲后刷新可选工序（也可直接选片后试算，服务端会校验）</option>
+        {% endif %}
+      </select>
+    </label>
+    <div class="actions">
+      <button class="button" type="submit" {% if wafers|length < 2 %}disabled{% endif %}>从已提交状态取数试算</button>
+    </div>
+  </form>
+</section>
+
+{% if trial %}
+<section class="panel">
+  <div class="panel-head">
+    <h3>试算结果 · 对调工序“{{ trial.step_name }}”（第 {{ trial.step_seq }} 道，非基准）</h3>
+    <span class="badge ok">只读试算，尚未改动数据库</span>
+  </div>
+  <p class="muted small">
+    试算取数时修订号：
+    {% for w in trial.wafers %}<span class="chip mono">{{ w.name }} r{{ w.revision }}</span>{% endfor %}
+    ；确认时若任一片修订号已变化（补点/改点/撤点/对调成功），会被拒绝并提示重新试算。
+  </p>
+
+  <table class="table compact">
+    <thead>
+      <tr>
+        <th>晶圆</th>
+        <th>网格</th>
+        <th>可行方案（换前 → 换后）</th>
+        <th>待定缺陷数（换前 → 换后）</th>
+        <th>换入明细与其他工序的同号定位点</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for w in trial.wafers %}
+      <tr>
+        <td>{{ w.name }}<br><span class="muted small mono">r{{ w.revision }}</span></td>
+        <td class="mono">{{ w.grid_size }}×{{ w.grid_size }}</td>
+        <td class="mono">{{ w.schemes_before }} → {{ w.schemes_after }}</td>
+        <td>
+          <span class="mono">{{ w.pending_before }} → {{ w.pending_after }}</span>
+          {% if w.pending_after < w.pending_before %}<span class="badge ok">减少 {{ w.pending_before - w.pending_after }}</span>
+          {% elif w.pending_after > w.pending_before %}<span class="badge warn">增加 {{ w.pending_after - w.pending_before }}</span>
+          {% else %}<span class="badge">不变</span>{% endif %}
+        </td>
+        <td class="small">
+          {% set shared = trial.shared_locators[loop.index0] %}
+          {% for pid in shared %}<span class="chip mono">{{ pid }}</span>{% else %}<span class="badge bad">无</span>{% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h4>逐工序待定缺陷数明细</h4>
+  <table class="table compact">
+    <thead>
+      <tr><th>晶圆</th><th>#</th><th>工序</th><th>换前待定</th><th>换后待定</th></tr>
+    </thead>
+    <tbody>
+      {% for w in trial.wafers %}
+        {% for s in w.steps %}
+        <tr {% if s.swapped %}class="selected"{% endif %}>
+          {% if loop.first %}<td rowspan="{{ w.steps|length }}">{{ w.name }}</td>{% endif %}
+          <td class="mono">{{ s.seq }}</td>
+          <td>{{ s.name }}{% if s.swapped %}<span class="badge base">对调</span>{% endif %}</td>
+          <td class="mono">{{ s.pending_before }}</td>
+          <td class="mono">{{ s.pending_after }}</td>
+        </tr>
+        {% endfor %}
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <form method="post" action="{{ url_for('swap_commit') }}" class="actions"
+        onsubmit="return confirm('确认对调两片晶圆的“{{ trial.step_name }}”工序明细？校验或保存失败会整体保留对调前状态。');">
+    <input type="hidden" name="left_id" value="{{ trial.wafers[0].wafer_id }}">
+    <input type="hidden" name="right_id" value="{{ trial.wafers[1].wafer_id }}">
+    <input type="hidden" name="step_name" value="{{ trial.step_name }}">
+    <input type="hidden" name="rev_left" value="{{ trial.wafers[0].revision }}">
+    <input type="hidden" name="rev_right" value="{{ trial.wafers[1].revision }}">
+    <button class="button" type="submit">确认对调（同一事务保存两片）</button>
+    <a class="button ghost" href="{{ url_for('swap_form') }}">放弃，重新选择</a>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

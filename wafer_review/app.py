@@ -17,7 +17,7 @@ from flask import (
 from .db import connect, init_db
 from .display import mapped_grid, transform_label
 from .gridview import build_grid
-from .model import NoSolutionError, WaferError, analyze
+from .model import NoSolutionError, ValidationError, WaferError, analyze
 from .overlay import compare_grid
 from .service import (
     MAX_STEPS,
@@ -29,7 +29,9 @@ from .service import (
     list_wafers,
     load_wafer,
     remove_locator,
+    swap_step_details,
 )
+from .swap import StaleSnapshotError, plan_swap
 
 DEFAULT_DB = "data/wafer_review.sqlite3"
 
@@ -84,6 +86,26 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("index"))
         flash("演示晶圆已建立：6 道工序、8×8 网格", "ok")
         return redirect(url_for("wafer_detail", wafer_id=wafer_id))
+
+    @app.post("/wafers/demo-swap-pair")
+    def create_demo_swap_pair():
+        """一次建立两片“封装 CSV 传反”的同规格晶圆，随后跳到对调试算页。"""
+        from .demo import swapped_demo_pair
+
+        ids: list[int] = []
+        try:
+            for name, samples in swapped_demo_pair():
+                steps = [StepInput(step_name, text) for step_name, text in samples]
+                ids.append(create_wafer(app.config["DATABASE"], name, 8, steps))
+        except (WaferError, OSError, sqlite3.Error) as exc:
+            for wafer_id in ids:
+                delete_wafer(app.config["DATABASE"], wafer_id)
+            flash(f"对调演示数据建立失败：{exc}", "error")
+            return redirect(url_for("index"))
+        flash("已建立两片同规格晶圆（封装工序传反），请选择工序并试算对调", "ok")
+        return redirect(
+            url_for("swap_form", left_id=ids[0], right_id=ids[1], step="封装")
+        )
 
     @app.get("/samples/<name>.csv")
     def sample_csv(name: str):
@@ -274,6 +296,156 @@ def create_app(test_config: dict | None = None) -> Flask:
         delete_wafer(app.config["DATABASE"], wafer_id)
         flash("晶圆记录已删除", "ok")
         return redirect(url_for("index"))
+
+    def _load_two(left_id: int, right_id: int):
+        with connect(app.config["DATABASE"]) as conn:
+            left = load_wafer(conn, left_id)
+            right = load_wafer(conn, right_id)
+        if left is None or right is None:
+            abort(404)
+        return left, right
+
+    def _parse_swap_form():
+        try:
+            left_id = int(request.form.get("left_id", ""))
+            right_id = int(request.form.get("right_id", ""))
+        except ValueError:
+            raise ValidationError("请选择两片晶圆")
+        step_name = request.form.get("step_name", "").strip()
+        if not step_name:
+            raise ValidationError("请选择要对调的同名非基准工序")
+        return left_id, right_id, step_name
+
+    @app.get("/wafers/swaps")
+    def swap_form():
+        with connect(app.config["DATABASE"]) as conn:
+            wafers = list_wafers(conn)
+        preselect = {
+            "left_id": request.args.get("left_id", ""),
+            "right_id": request.args.get("right_id", ""),
+            "step": request.args.get("step", ""),
+        }
+        # 同规格候选：网格与工序结构一致的晶圆两两一组提示给页面。
+        return render_template("swap.html", wafers=wafers, preselect=preselect, trial=None)
+
+    @app.post("/wafers/swaps/trial")
+    def swap_trial():
+        raw_left = request.form.get("left_id", "")
+        raw_right = request.form.get("right_id", "")
+        step_name = request.form.get("step_name", "").strip()
+        trial = None
+        try:
+            left_id, right_id, step_name = _parse_swap_form()
+            left, right = _load_two(left_id, right_id)
+            trial = plan_swap(left, right, step_name)
+        except NoSolutionError as exc:
+            flash(f"试算未通过：{exc}", "error")
+        except WaferError as exc:
+            flash(f"试算未通过：{exc}", "error")
+        with connect(app.config["DATABASE"]) as conn:
+            wafers = list_wafers(conn)
+        return render_template(
+            "swap.html",
+            wafers=wafers,
+            preselect={"left_id": raw_left, "right_id": raw_right, "step": step_name},
+            trial=trial,
+        )
+
+    @app.post("/wafers/swaps/commit")
+    def swap_commit():
+        left_id = request.form.get("left_id", "")
+        right_id = request.form.get("right_id", "")
+        step_name = request.form.get("step_name", "").strip()
+        try:
+            left_id, right_id, step_name = _parse_swap_form()
+            try:
+                rev_left = int(request.form.get("rev_left", ""))
+                rev_right = int(request.form.get("rev_right", ""))
+            except ValueError:
+                raise ValidationError("缺少试算修订号，请重新试算")
+            trial = swap_step_details(
+                app.config["DATABASE"],
+                left_id,
+                right_id,
+                step_name,
+                {left_id: rev_left, right_id: rev_right},
+            )
+        except StaleSnapshotError as exc:
+            flash(f"请重新试算：{exc}", "warn")
+            return redirect(
+                url_for(
+                    "swap_form",
+                    left_id=left_id,
+                    right_id=right_id,
+                    step=step_name,
+                )
+            )
+        except NoSolutionError as exc:
+            flash(f"对调未生效：{exc} 两片均保留对调前状态。", "error")
+            return redirect(
+                url_for(
+                    "swap_form",
+                    left_id=left_id,
+                    right_id=right_id,
+                    step=step_name,
+                )
+            )
+        except (WaferError, OSError, sqlite3.Error) as exc:
+            flash(f"对调失败：{exc}；两片均保留对调前状态。", "error")
+            return redirect(url_for("swap_form"))
+        a, b = trial.wafers
+        flash(
+            "对调成功："
+            f"{a.name} 待定缺陷 {a.pending_before} → {a.pending_after}；"
+            f"{b.name} 待定缺陷 {b.pending_before} → {b.pending_after}。"
+            "两片工序明细、修订号与坐标查询已一并更新。",
+            "ok",
+        )
+        return redirect(url_for("wafer_detail", wafer_id=left_id))
+
+    @app.post("/api/wafers/swaps/trial")
+    def api_swap_trial():
+        payload = request.get_json(silent=True) or {}
+        try:
+            left_id = int(payload.get("left_id"))
+            right_id = int(payload.get("right_id"))
+        except (TypeError, ValueError):
+            return {"error": "left_id / right_id 必须是整数"}, 400
+        step_name = str(payload.get("step_name", "")).strip()
+        if not step_name:
+            return {"error": "缺少 step_name"}, 400
+        try:
+            left, right = _load_two(left_id, right_id)
+            trial = plan_swap(left, right, step_name)
+        except WaferError as exc:
+            return {"error": str(exc)}, 409
+        return {
+            "step_name": trial.step_name,
+            "step_seq": trial.step_seq,
+            "wafers": [
+                {
+                    "wafer_id": w.wafer_id,
+                    "name": w.name,
+                    "revision": w.revision,
+                    "pending_before": w.pending_before,
+                    "pending_after": w.pending_after,
+                    "schemes_before": w.schemes_before,
+                    "schemes_after": w.schemes_after,
+                    "steps": [
+                        {
+                            "seq": s.seq,
+                            "name": s.name,
+                            "swapped": s.swapped,
+                            "pending_before": s.pending_before,
+                            "pending_after": s.pending_after,
+                        }
+                        for s in w.steps
+                    ],
+                }
+                for w in trial.wafers
+            ],
+            "shared_locators": [list(pids) for pids in trial.shared_locators],
+        }
 
     @app.get("/api/wafers/<int:wafer_id>/defects")
     def api_defects(wafer_id: int):
